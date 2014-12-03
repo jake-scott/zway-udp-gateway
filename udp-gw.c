@@ -1,3 +1,19 @@
+/*
+ * Original work Copyright (c) 2014 Jake Scott
+ *
+ * This file is licensed to you under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,6 +25,7 @@
 #include <netdb.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <syslog.h>
@@ -19,6 +36,7 @@
 
 extern const char *__progname;
 
+// Long style command line options
 static const struct option cmd_options[] =
 {
     {"foreground", 0, 0, 'f'},
@@ -31,11 +49,18 @@ static const struct option cmd_options[] =
     {0, 0, 0, 0}
 };
 
+// .. and the short style spec
 static const char *opt_spec = "fhda:p:s:i:";
+
+// defaults
 static const char *def_pid_file = "/var/run/udp-gw.pid";
 static int log_level = LOG_INFO;
 static int log_to_stderr = 1;
 
+// string representation of ULONG_MAX is 20 characters on 64-bit systems
+static const int LEN_ULONG = 20;
+
+// Hold program options and other related state like fifo and log file descriptors
 struct udp_gw_opts
 {
     int foreground;
@@ -52,6 +77,39 @@ struct udp_gw_opts
 };
 
 
+// Log a line, either to stderr in foreground mode and before daemonising -- or to syslog
+// when detached.  level is the syslog level number
+static int
+udpgwlog( int level, const char *format, ... )
+{
+    static int opened = 0;
+
+    va_list vargs;
+    va_start(vargs, format);
+
+    if( log_to_stderr )
+    {
+        if( level > log_level )
+            return 0;
+
+        vfprintf(stderr, format, vargs);
+        fputc('\n', stderr);
+    }
+    else
+    {
+        if( ! opened )
+        {
+            openlog(__progname, LOG_NDELAY|LOG_PID|LOG_CONS, LOG_DAEMON);
+            opened = 1;
+        }
+        vsyslog(level, format, vargs);
+    }
+
+    return 0;
+}
+
+
+// Close / free stuff
 static void
 cleanup(struct udp_gw_opts *pgwopts)
 {
@@ -149,7 +207,7 @@ process_cmdline(int argc, char *argv[], struct udp_gw_opts *pgwopts)
                 fprintf(stderr, "Out of memory");
                 return 1;
             }
-
+            break;
         case 'h':
             usage();
             pgwopts->has_help = 1;
@@ -171,37 +229,41 @@ process_cmdline(int argc, char *argv[], struct udp_gw_opts *pgwopts)
 }
 
 
-int
-udpgwlog( int level, const char *format, ... )
+// Open and lock the PID file.  The file remains open during the lifetime of the process
+//
+static int
+lock_pidfile( struct udp_gw_opts *pgwopts )
 {
-    static int opened = 0;
-
-    va_list vargs;
-    va_start(vargs, format);
-
-    if( log_to_stderr )
+    // Open the file
+    int fd = open(pgwopts->pid_file, O_CREAT|O_RDWR, 0777);
+    if( -1 == fd )
     {
-        if( level > log_level )
-            return 0;
+        udpgwlog(LOG_ERR, "Failed to open [%s]: %s", pgwopts->pid_file, strerror(errno));
+        return 1;
+    }
 
-        vfprintf(stderr, format, vargs);
-        fputc('\n', stderr);
-    }
-    else
+    // Lock it (non-blocking)
+    int res = flock(fd, LOCK_EX|LOCK_NB);
+    if( -1 == res )
     {
-        if( ! opened )
-        {
-            openlog(__progname, LOG_NDELAY|LOG_PID|LOG_CONS, LOG_DAEMON);
-            opened = 1;
-        }
-        vsyslog(level, format, vargs);
+        udpgwlog(LOG_ERR, "Can't get lock on PID file [%s], is another instance running?", pgwopts->pid_file);
+        close(fd);
+        return 1;
     }
+
+    // Write our PID to it
+    char pid[LEN_ULONG + 1];
+    snprintf(pid, LEN_ULONG, "%d\n", getpid());
+    write(fd, pid, strlen(pid));
+    fsync(fd);
 
     return 0;
 }
 
 
-int
+// Do the usual daemon stuff..
+//
+static int
 daemonise(void)
 {
     int pid = fork();
@@ -209,7 +271,7 @@ daemonise(void)
         udpgwlog(LOG_ERR, "Failed to fork: %s", strerror(errno));
         return 0;
     }
-     
+
     // parent
     if( pid > 0 )
         exit(0);
@@ -231,11 +293,14 @@ daemonise(void)
     chdir("/");
     log_to_stderr = 0;
 
-    return 1; 
+    return 1;
 }
 
-static
-int open_fifo( struct udp_gw_opts *pgwopts )
+
+// Opens the controlling FIFO
+//
+static int
+open_fifo( struct udp_gw_opts *pgwopts )
 {
     int res;
 
@@ -281,6 +346,9 @@ int open_fifo( struct udp_gw_opts *pgwopts )
     return 0;
 }
 
+
+// Open the UDP socket and connect it so we can use send() later
+//
 static int
 open_socket( struct udp_gw_opts *pgwopts )
 {
@@ -311,6 +379,8 @@ open_socket( struct udp_gw_opts *pgwopts )
 }
 
 
+// Extract a variable from the JSON input
+//
 static const char *
 json_get(yajl_val node, const char *key, int required)
 {
@@ -326,6 +396,8 @@ json_get(yajl_val node, const char *key, int required)
 }
 
 
+// Process some input from the FIFO
+//
 static int
 process_data( struct udp_gw_opts *pgwopts, void *data, size_t data_sz )
 {
@@ -333,7 +405,7 @@ process_data( struct udp_gw_opts *pgwopts, void *data, size_t data_sz )
     char buff[1024];
     int ret = 0;
 
-    // Parse JSON
+    // Parse JSON string
     node = yajl_tree_parse( (const char *) data, buff, sizeof(buff) );
 
     if( NULL == node )
@@ -343,9 +415,10 @@ process_data( struct udp_gw_opts *pgwopts, void *data, size_t data_sz )
         goto done;
     }
 
+    // Extract the parameters we need
     const char *v_devnum  = json_get(node, "devnum", 1);
     const char *v_devname = json_get(node, "devname", 1);
-    const char *v_devtype  = json_get(node, "devtype", 1);
+    const char *v_devtype = json_get(node, "devtype", 1);
     const char *v_param   = json_get(node, "param", 1);
     const char *v_value   = json_get(node, "value", 1);
 
@@ -355,9 +428,11 @@ process_data( struct udp_gw_opts *pgwopts, void *data, size_t data_sz )
         goto done;
     }
 
+    // Create the UDP message
     int nchars = snprintf(buff, sizeof(buff) - 1, "ZWAVE:%s:%s:%s:%s:%s",
-                    v_devtype, v_devnum, v_devname, v_param, v_value );
+                          v_devtype, v_devnum, v_devname, v_param, v_value );
 
+    // Send it to the network
     int res = send( pgwopts->sockfd, (void *) buff, nchars, 0);
     if( -1 == res )
     {
@@ -384,6 +459,10 @@ done:
 }
 
 
+// Wait for data on the FIFO
+// Send the string 'EXIT' to quit, otherwise send JSON to be processed and spat out onto the 
+// network as a UDP packet
+//
 static int
 request_loop( struct udp_gw_opts *pgwopts )
 {
@@ -407,7 +486,7 @@ request_loop( struct udp_gw_opts *pgwopts )
             ret = 1;
             break;
         }
-        
+
         buff[num_read] = '\0';
 
         if( strncmp(buff, "EXIT", 4) == 0 )
@@ -423,6 +502,8 @@ request_loop( struct udp_gw_opts *pgwopts )
 }
 
 
+// Entry point
+//
 int
 main(int argc, char *argv[])
 {
@@ -443,8 +524,13 @@ main(int argc, char *argv[])
         return 1;
     }
 
+    // Background ourselves unless told not to
     if( ! gwopts.foreground )
         daemonise();
+
+    // Lock the PID file to make sure we don't run more than one instance..
+    if( 0 != lock_pidfile(&gwopts) )
+        return 1;
 
     // Open the FIFO
     if( 0 != open_fifo(&gwopts) )
@@ -457,6 +543,7 @@ main(int argc, char *argv[])
     // Do real work!
     int ret = request_loop(&gwopts);
 
+    // Close/free stuff, not really necessary but helpful when checking for leaks in valgrind
     cleanup(&gwopts);
 
     return ret;

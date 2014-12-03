@@ -2,7 +2,7 @@ BIN = udp-gw
 SRCS = udp-gw.c
 OBJS = $(SRCS:.c=.o)
 
-CPPFLAGS = D_GNU_SOURCE
+CPPFLAGS = -D_GNU_SOURCE
 CFLAGS = -std=c99
 LDFLAGS =
 LDLIBS = -lyajl
